@@ -1,17 +1,18 @@
 """
-MFL Moneyball Sync
-Fetches all players + their full competition history,
-aggregates everything into career totals, upserts one row per player.
+MFL Moneyball - Full Database Sync with Checkpoint
+Runs daily via schedule, picks up where it left off.
+Covers all ~377,000 player IDs over ~7 days.
 """
 
 import os, time, requests
+from datetime import datetime, timezone
 from supabase import create_client
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL     = "https://z519wdyajg.execute-api.us-east-1.amazonaws.com/prod"
-ORIGIN       = "https://app.playmfl.com"
-PLAYER_LIMIT = 1000
-RATE_DELAY   = 0.3  # seconds between requests
+BASE_URL      = "https://z519wdyajg.execute-api.us-east-1.amazonaws.com/prod"
+ORIGIN        = "https://app.playmfl.com"
+MAX_PLAYER_ID = 377200
+RATE_DELAY    = 0.25
+MAX_RUNTIME   = 5.5 * 3600  # 5.5 hours in seconds
 
 SUPABASE_URL  = os.environ["SUPABASE_URL"]
 SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
@@ -20,40 +21,52 @@ REFRESH_TOKEN = os.environ["MFL_REFRESH_TOKEN"]
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
-def get_access_token(refresh_token: str) -> str:
+def get_access_token() -> str:
     print("Refreshing access token...")
     resp = requests.post(
         f"{BASE_URL}/auth/refresh",
-        json={"refreshToken": refresh_token},
+        json={"refreshToken": REFRESH_TOKEN},
         headers={"origin": ORIGIN},
         timeout=10
     )
     resp.raise_for_status()
     token = resp.json()["access"]["token"]
-    print("  Access token obtained.")
+    print("  Token obtained ✅")
     return token
 
-def headers(token: str) -> dict:
+def make_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "origin": ORIGIN}
 
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+def get_checkpoint() -> dict:
+    result = supabase.table("mfl_sync_checkpoint").select("*").eq("id", 1).execute()
+    return result.data[0]
+
+def save_checkpoint(last_id: int, total_processed: int, total_found: int, completed: bool = False):
+    supabase.table("mfl_sync_checkpoint").update({
+        "last_id":         last_id,
+        "total_processed": total_processed,
+        "total_found":     total_found,
+        "completed":       completed,
+        "updated_at":      datetime.now(timezone.utc).isoformat()
+    }).eq("id", 1).execute()
+
 # ── Fetch ─────────────────────────────────────────────────────────────────────
-def fetch_players(token: str) -> list:
-    print(f"Fetching players (limit={PLAYER_LIMIT})...")
+def fetch_player(player_id: int, token: str) -> dict | None:
     resp = requests.get(
-        f"{BASE_URL}/players",
-        params={"limit": PLAYER_LIMIT},
-        headers=headers(token),
-        timeout=15
+        f"{BASE_URL}/players/{player_id}",
+        headers=make_headers(token),
+        timeout=10
     )
+    if resp.status_code == 404:
+        return None
     resp.raise_for_status()
-    players = resp.json()
-    print(f"  Got {len(players)} players")
-    return players
+    return resp.json().get("player")
 
 def fetch_competitions(player_id: int, token: str) -> list:
     resp = requests.get(
         f"{BASE_URL}/players/{player_id}/competitions",
-        headers=headers(token),
+        headers=make_headers(token),
         timeout=10
     )
     if resp.status_code == 404:
@@ -62,43 +75,26 @@ def fetch_competitions(player_id: int, token: str) -> list:
     return resp.json()
 
 # ── Aggregate ─────────────────────────────────────────────────────────────────
-def aggregate(player: dict, competition_entries: list) -> dict:
-    """Combine player metadata + all competition entries into one flat row."""
+def aggregate(player: dict, entries: list) -> dict:
     m     = player["metadata"]
     owner = player.get("ownedBy") or {}
 
     totals = {
-        "total_matches":         0,
-        "total_minutes":         0,
-        "total_goals":           0,
-        "total_assists":         0,
-        "total_shots":           0,
-        "total_shots_on_target": 0,
-        "total_xg":              0,
-        "total_passes":          0,
-        "total_passes_accurate": 0,
-        "total_chances_created": 0,
-        "total_dribbling":       0,
-        "total_def_duels_won":   0,
-        "total_clearances":      0,
-        "total_yellow_cards":    0,
-        "total_red_cards":       0,
-        "total_wins":            0,
-        "total_draws":           0,
-        "total_losses":          0,
-        "total_saves":           0,
-        "total_goals_conceded":  0,
-        "total_rating_sum":      0,
+        "total_matches": 0, "total_minutes": 0, "total_goals": 0,
+        "total_assists": 0, "total_shots": 0, "total_shots_on_target": 0,
+        "total_xg": 0, "total_passes": 0, "total_passes_accurate": 0,
+        "total_chances_created": 0, "total_dribbling": 0,
+        "total_def_duels_won": 0, "total_clearances": 0,
+        "total_yellow_cards": 0, "total_red_cards": 0,
+        "total_wins": 0, "total_draws": 0, "total_losses": 0,
+        "total_saves": 0, "total_goals_conceded": 0, "total_rating_sum": 0,
     }
+    seen_seasons = set()
+    seen_comps   = set()
 
-    seen_seasons      = set()
-    seen_competitions = set()
-
-    for entry in competition_entries:
+    for entry in entries:
         s    = entry.get("stats", {})
         comp = entry.get("competition", {})
-        season = comp.get("season", {})
-
         totals["total_matches"]         += s.get("nbMatches", 0)
         totals["total_minutes"]         += s.get("time", 0) // 60
         totals["total_goals"]           += s.get("goals", 0)
@@ -120,26 +116,18 @@ def aggregate(player: dict, competition_entries: list) -> dict:
         totals["total_saves"]           += s.get("saves", 0)
         totals["total_goals_conceded"]  += s.get("goalsConceded", 0)
         totals["total_rating_sum"]      += s.get("rating", 0)
-
-        seen_seasons.add(season.get("name", "unknown"))
-        seen_competitions.add(comp.get("id"))
+        seen_seasons.add(comp.get("season", {}).get("name", "unknown"))
+        seen_comps.add(comp.get("id"))
 
     mins = totals["total_minutes"]
     p90  = mins / 90 if mins > 0 else None
-
-    def per90(val):
-        return round(val / p90, 2) if p90 else None
-
-    def pct(num, denom):
-        return round(num / denom * 100, 1) if denom > 0 else None
+    def per90(v): return round(v / p90, 2) if p90 else None
+    def pct(n, d): return round(n / d * 100, 1) if d > 0 else None
 
     return {
-        # Identity
         "id":               player["id"],
         "first_name":       m.get("firstName"),
         "last_name":        m.get("lastName"),
-
-        # Attributes
         "overall":          m.get("overall"),
         "age":              m.get("age"),
         "height":           m.get("height"),
@@ -154,18 +142,12 @@ def aggregate(player: dict, competition_entries: list) -> dict:
         "defense":          m.get("defense"),
         "physical":         m.get("physical"),
         "goalkeeping":      m.get("goalkeeping"),
-
-        # Ownership
         "owner_wallet":     owner.get("walletAddress"),
         "owner_name":       owner.get("name"),
         "energy":           player.get("energy"),
         "has_pre_contract": player.get("hasPreContract", False),
         "offer_status":     player.get("offerStatus", 0),
-
-        # Career totals
         **totals,
-
-        # Per-90
         "goals_p90":     per90(totals["total_goals"]),
         "assists_p90":   per90(totals["total_assists"]),
         "xg_p90":        per90(totals["total_xg"]),
@@ -173,72 +155,96 @@ def aggregate(player: dict, competition_entries: list) -> dict:
         "chances_p90":   per90(totals["total_chances_created"]),
         "def_duels_p90": per90(totals["total_def_duels_won"]),
         "shots_p90":     per90(totals["total_shots"]),
-
-        # Percentages
-        "pass_acc_pct": pct(totals["total_passes_accurate"], totals["total_passes"]),
-        "shot_acc_pct": pct(totals["total_shots_on_target"], totals["total_shots"]),
-        "win_pct":      pct(totals["total_wins"], totals["total_matches"]),
-        "avg_rating":   round(totals["total_rating_sum"] / totals["total_matches"], 2)
-                        if totals["total_matches"] > 0 else None,
-
-        # Context
+        "pass_acc_pct":  pct(totals["total_passes_accurate"], totals["total_passes"]),
+        "shot_acc_pct":  pct(totals["total_shots_on_target"], totals["total_shots"]),
+        "win_pct":       pct(totals["total_wins"], totals["total_matches"]),
+        "avg_rating":    round(totals["total_rating_sum"] / totals["total_matches"], 2)
+                         if totals["total_matches"] > 0 else None,
         "seasons_played":      len(seen_seasons),
-        "competitions_played": len(seen_competitions),
+        "competitions_played": len(seen_comps),
     }
 
 # ── Upsert ────────────────────────────────────────────────────────────────────
 def upsert_batch(rows: list):
     for i in range(0, len(rows), 200):
-        chunk = rows[i:i+200]
-        supabase.table("mfl_players").upsert(chunk, on_conflict="id").execute()
+        supabase.table("mfl_players").upsert(
+            rows[i:i+200], on_conflict="id"
+        ).execute()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    access_token = get_access_token(REFRESH_TOKEN)
-    players      = fetch_players(access_token)
+    start_time = time.time()
 
-    print(f"\nAggregating career stats for {len(players)} players...")
-    rows   = []
-    errors = []
+    # Check checkpoint
+    checkpoint = get_checkpoint()
+    if checkpoint["completed"]:
+        print("✅ Full sync already completed! Reset checkpoint to re-run.")
+        return
 
-    for i, p in enumerate(players):
-        pid = p["id"]
+    start_id       = checkpoint["last_id"] + 1
+    total_processed = checkpoint["total_processed"]
+    total_found     = checkpoint["total_found"]
+
+    print(f"Resuming from ID {start_id} (processed so far: {total_processed:,})")
+
+    token      = get_access_token()
+    batch      = []
+    last_id    = start_id - 1
+    token_time = time.time()
+
+    for player_id in range(start_id, MAX_PLAYER_ID + 1):
+
+        # Refresh token every 90 minutes
+        if time.time() - token_time > 90 * 60:
+            token      = get_access_token()
+            token_time = time.time()
+
+        # Check runtime limit
+        elapsed = time.time() - start_time
+        if elapsed > MAX_RUNTIME:
+            print(f"\n⏱ Time limit reached after {elapsed/3600:.1f}hrs")
+            break
+
         try:
-            entries = fetch_competitions(pid, access_token)
-            row     = aggregate(p, entries)
-            rows.append(row)
+            player = fetch_player(player_id, token)
+            total_processed += 1
+            last_id = player_id
 
-            if (i + 1) % 50 == 0:
-                print(f"  {i+1}/{len(players)} — {row['first_name']} {row['last_name']} "
-                      f"| {row['total_matches']} matches across {row['competitions_played']} comps")
+            if player is None:
+                time.sleep(0.1)  # shorter delay for 404s
+                continue
+
+            entries = fetch_competitions(player_id, token)
+            row     = aggregate(player, entries)
+            batch.append(row)
+            total_found += 1
+
+            # Upsert in batches of 200
+            if len(batch) >= 200:
+                upsert_batch(batch)
+                save_checkpoint(last_id, total_processed, total_found)
+                print(f"  ID {player_id:,} | found {total_found:,} | processed {total_processed:,} | {elapsed/3600:.1f}hrs elapsed")
+                batch = []
 
             time.sleep(RATE_DELAY)
 
         except Exception as e:
-            print(f"  ERROR player {pid}: {e}")
-            errors.append(pid)
-            time.sleep(1)
+            print(f"  ERROR at ID {player_id}: {e}")
+            time.sleep(2)
 
-    print(f"\nUpserting {len(rows)} rows to Supabase...")
-    upsert_batch(rows)
+    # Upsert any remaining
+    if batch:
+        upsert_batch(batch)
 
-    if errors:
-        print(f"\nRetrying {len(errors)} failed players...")
-        retry_rows = []
-        for pid in errors:
-            try:
-                p_resp  = requests.get(f"{BASE_URL}/players/{pid}", headers=headers(access_token), timeout=10)
-                p       = p_resp.json()["player"]
-                entries = fetch_competitions(pid, access_token)
-                retry_rows.append(aggregate(p, entries))
-                print(f"  Retry OK: {pid}")
-                time.sleep(1)
-            except Exception as e:
-                print(f"  Retry FAILED {pid}: {e}")
-        if retry_rows:
-            upsert_batch(retry_rows)
+    # Check if fully complete
+    completed = last_id >= MAX_PLAYER_ID
+    save_checkpoint(last_id, total_processed, total_found, completed)
 
-    print(f"\n✅ Done. {len(rows)} players synced, {len(errors)} errors.")
+    print(f"\n{'✅ FULL SYNC COMPLETE' if completed else '⏸ Paused — will resume tomorrow'}")
+    print(f"  Last ID processed: {last_id:,}")
+    print(f"  Total processed:   {total_processed:,}")
+    print(f"  Total found:       {total_found:,}")
+    print(f"  Runtime:           {(time.time()-start_time)/3600:.1f}hrs")
 
 if __name__ == "__main__":
     main()
