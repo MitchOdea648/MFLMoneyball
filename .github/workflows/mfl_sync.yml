@@ -1,11 +1,14 @@
 name: MFL Moneyball Sync
 
 on:
-  workflow_dispatch:  # Manual trigger only
+  schedule:
+    - cron: '0 2 * * *'  # Every day at 2am UTC
+  workflow_dispatch:       # Also keep manual trigger
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6 hour GitHub limit
     steps:
       - uses: actions/checkout@v4
 
