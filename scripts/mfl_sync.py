@@ -11,7 +11,7 @@ from supabase import create_client
 BASE_URL      = "https://z519wdyajg.execute-api.us-east-1.amazonaws.com/prod"
 ORIGIN        = "https://app.playmfl.com"
 MAX_PLAYER_ID = 377200
-RATE_DELAY    = 0.25
+RATE_DELAY    = 0.5
 MAX_RUNTIME   = 5.5 * 3600  # 5.5 hours in seconds
 
 SUPABASE_URL  = os.environ["SUPABASE_URL"]
@@ -181,11 +181,11 @@ def main():
         print("✅ Full sync already completed! Reset checkpoint to re-run.")
         return
 
-    start_id       = checkpoint["last_id"] + 1
+    start_id        = checkpoint["last_id"] + 1
     total_processed = checkpoint["total_processed"]
     total_found     = checkpoint["total_found"]
 
-    print(f"Resuming from ID {start_id} (processed so far: {total_processed:,})")
+    print(f"Resuming from ID {start_id:,} (processed so far: {total_processed:,}, found: {total_found:,})")
 
     token      = get_access_token()
     batch      = []
@@ -211,7 +211,8 @@ def main():
             last_id = player_id
 
             if player is None:
-                time.sleep(0.1)  # shorter delay for 404s
+                # 404 — player doesn't exist, short delay and move on
+                time.sleep(0.1)
                 continue
 
             entries = fetch_competitions(player_id, token)
@@ -219,7 +220,7 @@ def main():
             batch.append(row)
             total_found += 1
 
-            # Upsert in batches of 200
+            # Upsert and save checkpoint every 200 found players
             if len(batch) >= 200:
                 upsert_batch(batch)
                 save_checkpoint(last_id, total_processed, total_found)
@@ -229,14 +230,34 @@ def main():
             time.sleep(RATE_DELAY)
 
         except Exception as e:
-            print(f"  ERROR at ID {player_id}: {e}")
-            time.sleep(2)
+            err = str(e)
+            if "403" in err:
+                # Rate limited — back off and retry same ID
+                time.sleep(15)
+                try:
+                    player = fetch_player(player_id, token)
+                    if player:
+                        entries = fetch_competitions(player_id, token)
+                        row     = aggregate(player, entries)
+                        batch.append(row)
+                        total_found += 1
+                    total_processed += 1
+                    last_id = player_id
+                except Exception as e2:
+                    print(f"  RETRY FAILED at ID {player_id}: {e2}")
+                    time.sleep(5)
+            elif "timeout" in err.lower():
+                print(f"  TIMEOUT at ID {player_id} — skipping")
+                time.sleep(5)
+            else:
+                print(f"  ERROR at ID {player_id}: {e}")
+                time.sleep(2)
 
-    # Upsert any remaining
+    # Upsert any remaining rows
     if batch:
         upsert_batch(batch)
 
-    # Check if fully complete
+    # Save final checkpoint
     completed = last_id >= MAX_PLAYER_ID
     save_checkpoint(last_id, total_processed, total_found, completed)
 
